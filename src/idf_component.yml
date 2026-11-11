@@ -1,0 +1,4 @@
+## Dependencias gestionadas por el IDF Component Manager (se descargan en el primer build)
+dependencies:
+  idf: ">=5.0"
+  espressif/mdns: "^1.4.0"

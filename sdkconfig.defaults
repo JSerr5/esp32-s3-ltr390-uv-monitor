@@ -1,0 +1,20 @@
+# ---- Flash ----
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+# ---- FreeRTOS: tick de 1 ms para que vTaskDelay(1 ms) sea >= 1 tick ----
+CONFIG_FREERTOS_HZ=1000
+
+# ---- Consola serial a 115200 baudios ----
+# Opcion A (por defecto): UART0 -> puerto USB rotulado "UART" del DevKitC-1
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+# Opcion B (puerto USB nativo rotulado "USB"): comentar las 3 lineas de arriba
+# y descomentar la siguiente:
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ---- Watchdog: se mantiene activo (TWDT + idle tasks) para detectar bloqueos ----
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=5

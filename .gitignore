@@ -1,0 +1,32 @@
+# PlatformIO build artifacts & environments
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# IDE and Editor configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Credentials & Private secrets (CRITICAL: Do not commit)
+secrets.h
+include/secrets.h
+**/secrets.h
+*.key
+*.pem
+*.env
+*.env.*
+
+# Logs and temporary files
+build_log.txt
+build_tail.txt
+*.log
+*.tmp
+
+# ESP-IDF auto-generated config & components
+sdkconfig.esp32-s3-devkitc-1
+sdkconfig.old
+managed_components/
