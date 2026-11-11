@@ -44,7 +44,7 @@ El firmware está desarrollado sobre el framework nativo **ESP-IDF v5.x** bajo P
 - **Panel Web Reactivo (SPA):** Tablero responsive HTML5/CSS3/JS empotrado en la memoria Flash del SoC, sin dependencias externas, con indicación de nivel de riesgo OMS (Bajo, Moderado, Alto, Muy Alto, Extremo).
 - **Servicio mDNS:** Descubrimiento de red automático en la URL amigable `http://UVindice.local`.
 - **API RESTful JSON:** Endpoint `/api/telemetry` con soporte CORS para integración con Grafana, Home Assistant o microservicios IoT.
-- **Seguridad y Confidencialidad:** Aislamiento de credenciales mediante `secrets.h` protegido por `.gitignore`, garantizando cero exposición de claves en repositorios públicos.
+- **Fácil Configuración:** Parámetros de red Wi-Fi y mDNS directamente accesibles y editables al inicio de `src/main.cpp`.
 
 ---
 
@@ -212,24 +212,12 @@ cd esp32-s3-ltr390-uv-monitor
 
 ### 2. Configurar Credenciales Wi-Fi
 
-Crea tu archivo privado `include/secrets.h` a partir de la plantilla:
+Abre el archivo `src/main.cpp` y edita directamente las líneas con el SSID y contraseña de tu red Wi-Fi (2.4 GHz):
 
-```bash
-cp include/secrets.h.example include/secrets.h
-```
-
-Edita `include/secrets.h`:
-
-```c
-#pragma once
-
+```cpp
 #define WIFI_SSID      "TuRedWiFi"
 #define WIFI_PASS      "TuClaveSecreta"
-#define MDNS_HOSTNAME  "UVindice"       // -> http://UVindice.local
 ```
-
-> [!IMPORTANT]  
-> El archivo `include/secrets.h` está estrictamente ignorado en `.gitignore` para proteger la privacidad de tu red y evitar filtraciones accidentales de credenciales.
 
 ### 3. Compilación y Carga de Firmware
 
@@ -261,9 +249,7 @@ Una vez conectado a tu red local Wi-Fi, abre tu navegador preferido:
 ```
 esp32-s3-ltr390-uv-monitor/
 ├── include/
-│   ├── README
-│   ├── secrets.h.example     # Plantilla pública de credenciales
-│   └── secrets.h             # Credenciales locales (ignorado por Git)
+│   └── README
 ├── lib/                      # Librerías auxiliares (opcional)
 ├── src/
 │   ├── CMakeLists.txt        # Registro de componentes ESP-IDF

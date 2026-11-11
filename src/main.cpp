@@ -26,21 +26,9 @@
 static const char *TAG = "LTR390";
 
 // ================= CREDENCIALES WIFI (2.4 GHz) =================
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-
-#ifndef WIFI_SSID
-#define WIFI_SSID      "TU_RED_WIFI"
-#endif
-
-#ifndef WIFI_PASS
-#define WIFI_PASS      "TU_PASSWORD_WIFI"
-#endif
-
-#ifndef MDNS_HOSTNAME
+#define WIFI_SSID      "TU_SSID"
+#define WIFI_PASS      "TU_PASSWORD"
 #define MDNS_HOSTNAME  "UVindice"      // -> http://UVindice.local
-#endif
 
 // ================= PINES HARDWARE ESP32-S3 =================
 static constexpr gpio_num_t PIN_SDA = GPIO_NUM_4;
