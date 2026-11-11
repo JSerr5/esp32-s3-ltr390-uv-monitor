@@ -64,8 +64,8 @@ static constexpr float    UVS_INTEG_MS  = 400.0f;
 static constexpr uint32_t UVS_MAX_CNT   = 1048575UL;
 static constexpr uint8_t  UVS_RATE_CODE = 4;   // 500 ms
 
-static constexpr uint8_t  ALS_GAIN_CODE = 1;
-static constexpr float    ALS_GAIN_VAL  = 3.0f;
+static constexpr uint8_t  ALS_GAIN_CODE = 0;   // Codigo 0 = Ganancia 1x (soporta hasta 157,285.8 Lux al sol directo sin saturarse)
+static constexpr float    ALS_GAIN_VAL  = 1.0f; // Factor 1.0x para la formula de Lux
 static constexpr uint8_t  ALS_RES_CODE  = 2;
 static constexpr uint8_t  ALS_RES_BITS  = 18;
 static constexpr float    ALS_INTEG_MS  = 100.0f;
@@ -74,6 +74,41 @@ static constexpr uint8_t  ALS_RATE_CODE = 3;   // 200 ms
 
 static constexpr uint32_t CONVERSION_TIMEOUT_MS = 1500;
 static constexpr int      MAX_I2C_FAILS = 5;
+
+// ================= FILTRO PASA-BAJAS (PROMEDIO MOVIL) =================
+// Ventana de 20 muestras (~10-12 s de integracion meteorologica) para planchar micro-fluctuaciones
+static constexpr uint8_t  MA_WINDOW_SIZE = 20;
+
+struct MovingAverageFilter {
+  uint32_t buf[MA_WINDOW_SIZE];
+  uint64_t sum;
+  uint8_t  idx;
+  uint8_t  count;
+
+  void reset() {
+    memset(buf, 0, sizeof(buf));
+    sum   = 0;
+    idx   = 0;
+    count = 0;
+  }
+
+  uint32_t push(uint32_t sample) {
+    if (count < MA_WINDOW_SIZE) {
+      buf[idx] = sample;
+      sum += sample;
+      count++;
+    } else {
+      sum -= buf[idx];
+      buf[idx] = sample;
+      sum += sample;
+    }
+    idx = (idx + 1) % MA_WINDOW_SIZE;
+    return (uint32_t)((sum + (count / 2)) / count);
+  }
+};
+
+static MovingAverageFilter s_uvsFilter = {};
+static MovingAverageFilter s_alsFilter = {};
 
 // ================= TABLAS =================
 struct ResConfig  { uint8_t code; uint8_t bits; float integ_ms; uint32_t max_counts; };
@@ -102,6 +137,8 @@ static SensorState currentState = STATE_MEASURING_UVS;
 static uint32_t    stateStartMs = 0;
 static uint32_t    lastUvsRaw   = 0;
 static uint32_t    lastAlsRaw   = 0;
+static uint32_t    avgUvsRaw    = 0;
+static uint32_t    avgAlsRaw    = 0;
 static bool        uvsSaturated = false;
 static bool        alsSaturated = false;
 static int         i2cFailCount = 0;
@@ -110,8 +147,11 @@ static int         i2cFailCount = 0;
 struct Telemetry {
   bool     valid;        // ya hay al menos un ciclo UVS+ALS completo
   bool     sensorOk;     // el sensor responde actualmente
-  float    uvi11, uvi14, lux;
-  uint32_t uvsRaw, alsRaw;
+  float    uvi11, uvi14, lux;         // valores filtrados (promedio movil)
+  float    uvi11Inst, uvi14Inst;      // valores instantaneos (400 ms)
+  uint32_t uvsRaw, alsRaw;            // cuentas filtradas (promedio movil)
+  uint32_t uvsRawInst, alsRawInst;    // cuentas crudas instantaneas
+  uint8_t  maCount, maWindow;         // estado de llenado del filtro pasa-bajas
   bool     uvsSat, alsSat;
   uint32_t updatedMs;    // marca de tiempo de la ultima muestra
 };
@@ -137,18 +177,24 @@ static const char *riskLevel(float uvi) {
   return "EXTREMO";
 }
 
-static void telemetryPublish(float uvi11, float uvi14, float lux) {
+static void telemetryPublish(float uvi11, float uvi14, float lux, float uvi11Inst, float uvi14Inst) {
   if (xSemaphoreTake(g_telMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
-  g_tel.valid     = true;
-  g_tel.sensorOk  = true;
-  g_tel.uvi11     = uvi11;
-  g_tel.uvi14     = uvi14;
-  g_tel.lux       = lux;
-  g_tel.uvsRaw    = lastUvsRaw;
-  g_tel.alsRaw    = lastAlsRaw;
-  g_tel.uvsSat    = uvsSaturated;
-  g_tel.alsSat    = alsSaturated;
-  g_tel.updatedMs = millis_ms();
+  g_tel.valid      = true;
+  g_tel.sensorOk   = true;
+  g_tel.uvi11      = uvi11;
+  g_tel.uvi14      = uvi14;
+  g_tel.lux        = lux;
+  g_tel.uvi11Inst  = uvi11Inst;
+  g_tel.uvi14Inst  = uvi14Inst;
+  g_tel.uvsRaw     = avgUvsRaw;
+  g_tel.alsRaw     = avgAlsRaw;
+  g_tel.uvsRawInst = lastUvsRaw;
+  g_tel.alsRawInst = lastAlsRaw;
+  g_tel.maCount    = s_uvsFilter.count;
+  g_tel.maWindow   = MA_WINDOW_SIZE;
+  g_tel.uvsSat     = uvsSaturated;
+  g_tel.alsSat     = alsSaturated;
+  g_tel.updatedMs  = millis_ms();
   xSemaphoreGive(g_telMutex);
 }
 
@@ -528,6 +574,8 @@ static void ltr390_task(void *arg) {
     printf("\n==================================================================\n");
     printf(" VALIDACION COMPLETADA -> INICIANDO TELEMETRIA CONTINUA UVS / ALS\n");
     printf("==================================================================\n\n");
+    s_uvsFilter.reset();
+    s_alsFilter.reset();
     sensorReady = true;
     startUvsMeasurement();
   } else {
@@ -538,6 +586,8 @@ static void ltr390_task(void *arg) {
     if (!sensorReady) {
       delay_ms(2000);
       if (runValidationPhase()) {
+        s_uvsFilter.reset();
+        s_alsFilter.reset();
         sensorReady = true;
         printf("\n[OK] Sensor recuperado. Iniciando telemetria continua UVS / ALS...\n\n");
         startUvsMeasurement();
@@ -559,6 +609,8 @@ static void ltr390_task(void *arg) {
     // Power_On_Status (bit 5): brownout, el sensor perdio la configuracion
     if (status & 0x20) {
       printf("[AVISO] Reinicio electrico detectado en LTR390 (Power_On_Status=1). Reconfigurando...\n");
+      s_uvsFilter.reset();
+      s_alsFilter.reset();
       startUvsMeasurement();
       continue;
     }
@@ -571,6 +623,7 @@ static void ltr390_task(void *arg) {
         uint32_t raw;
         if (readData20Bit(REG_UVS_DATA_0, raw)) {
           lastUvsRaw   = raw;
+          avgUvsRaw    = s_uvsFilter.push(raw);
           uvsSaturated = (raw >= UVS_MAX_CNT);
           startAlsMeasurement();
         }
@@ -583,20 +636,26 @@ static void ltr390_task(void *arg) {
         uint32_t raw;
         if (readData20Bit(REG_ALS_DATA_0, raw)) {
           lastAlsRaw   = raw;
+          avgAlsRaw    = s_alsFilter.push(raw);
           alsSaturated = (raw >= ALS_MAX_CNT);
 
-          float uvi_v1_1 = calculateUVI(lastUvsRaw, UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_1);
-          float uvi_v1_4 = calculateUVI(lastUvsRaw, UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_4);
-          float lux      = calculateLux(lastAlsRaw, ALS_GAIN_VAL, ALS_INTEG_MS);
+          // Valores suavizados con filtro pasa-bajas (promedio movil de 20 muestras)
+          float uvi_v1_1      = calculateUVI(avgUvsRaw,  UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_1);
+          float uvi_v1_4      = calculateUVI(avgUvsRaw,  UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_4);
+          float lux           = calculateLux(avgAlsRaw,  ALS_GAIN_VAL, ALS_INTEG_MS);
 
-          telemetryPublish(uvi_v1_1, uvi_v1_4, lux);
+          // Valores instantaneos crudos de 400 ms para comparacion tecnica
+          float uvi_v1_1_inst = calculateUVI(lastUvsRaw, UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_1);
+          float uvi_v1_4_inst = calculateUVI(lastUvsRaw, UVS_GAIN_VAL, UVS_INTEG_MS, UVI_SENSITIVITY_DS_V1_4);
 
-          printf("UVS: %7lu cts [G:%2.0fx, %2ub/%3.0fms%s] -> UVI(V1.1): %5.2f | UVI(V1.4): %5.2f  ||  "
-                 "ALS: %6lu cts [G:%2.0fx, %2ub/%3.0fms%s] -> Lux: %8.2f lx\n",
-                 (unsigned long)lastUvsRaw, UVS_GAIN_VAL, UVS_RES_BITS, UVS_INTEG_MS,
+          telemetryPublish(uvi_v1_1, uvi_v1_4, lux, uvi_v1_1_inst, uvi_v1_4_inst);
+
+          printf("UVS[MA%2u]: %7lu cts (inst:%7lu%s) -> UVI(V1.1): %5.2f | UVI(V1.4): %5.2f  ||  "
+                 "ALS[MA%2u]: %6lu cts (inst:%6lu%s) -> Lux: %8.2f lx\n",
+                 (unsigned)s_uvsFilter.count, (unsigned long)avgUvsRaw, (unsigned long)lastUvsRaw,
                  uvsSaturated ? ", SAT!" : "",
                  uvi_v1_1, uvi_v1_4,
-                 (unsigned long)lastAlsRaw, ALS_GAIN_VAL, ALS_RES_BITS, ALS_INTEG_MS,
+                 (unsigned)s_alsFilter.count, (unsigned long)avgAlsRaw, (unsigned long)lastAlsRaw,
                  alsSaturated ? ", SAT!" : "",
                  lux);
 
@@ -828,21 +887,22 @@ footer{display:flex;justify-content:space-between;align-items:center;flex-wrap:w
       <div class="lux-scale"><span>Noche (&lt;10)</span><span>Interior (500)</span><span>Nublado (10k)</span><span>Sol (&gt;10k)</span></div>
 
       <div class="spark-box">
-        <div class="spark-hdr"><span>Tendencia UVI en vivo (&uacute;ltimas muestras)</span><span id="sparkRange">--</span></div>
+        <div class="spark-hdr"><span>Curva suavizada (promedio m&oacute;vil 20 muestras)</span><span id="sparkRange">--</span></div>
         <svg class="spark-svg" viewBox="0 0 240 44" preserveAspectRatio="none">
-          <polyline id="sparkLine" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" points=""/>
+          <polyline id="sparkRaw" fill="none" stroke="var(--mut)" stroke-opacity="0.35" stroke-dasharray="2 2" stroke-width="1.3" points=""/>
+          <polyline id="sparkLine" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" points=""/>
         </svg>
       </div>
     </section>
 
     <section class="card">
-      <span class="lbl">&#9881;&#65039; Diagn&oacute;stico en Tiempo Real</span>
-      <div class="row" style="margin-top:8px"><span>Cuentas UVS (ADC)</span><span id="uvsRaw">--</span></div>
-      <div class="row"><span>Cuentas ALS (ADC)</span><span id="alsRaw">--</span></div>
-      <div class="row"><span>Configuraci&oacute;n UVS</span><span>18x &middot; 20 bits &middot; 400 ms</span></div>
-      <div class="row"><span>Configuraci&oacute;n ALS</span><span>3x &middot; 18 bits &middot; 100 ms</span></div>
-      <div class="row"><span>Edad de muestra sensor</span><span id="sampleAge">--</span></div>
-      <div class="row"><span>Estado ESP32-S3</span><span id="esp">--</span></div>
+      <span class="lbl">&#9881;&#65039; Diagn&oacute;stico y Filtro Pasa-Bajas</span>
+      <div class="row" style="margin-top:8px"><span>Filtro Pasa-Bajas (MA)</span><span id="maState">--</span></div>
+      <div class="row"><span>UVS Filtrado / Crudo</span><span id="uvsRaw">--</span></div>
+      <div class="row"><span>ALS Filtrado / Crudo</span><span id="alsRaw">--</span></div>
+      <div class="row"><span>UVI Instant&aacute;neo (400 ms)</span><span id="uviInst">--</span></div>
+      <div class="row"><span>Configuraci&oacute;n UVS / ALS</span><span>18x (20b) / 1x (18b)</span></div>
+      <div class="row"><span>Edad muestra &middot; ESP32-S3</span><span id="esp">--</span></div>
     </section>
   </div>
 
@@ -873,7 +933,7 @@ var LEVELS=[
 ];
 var ARC_LEN=282.74;
 var $=function(id){return document.getElementById(id);};
-var ver="v1_1", theme="light", history=[];
+var ver="v1_1", theme="light", history=[], historyRaw=[];
 try{
   var sv=localStorage.getItem("uvver"); if(sv==="v1_4")ver="v1_4";
   var st=localStorage.getItem("uvtheme"); if(st==="dark")theme="dark";
@@ -913,18 +973,30 @@ function setVer(v){
 }
 
 function drawSpark(){
-  var pts=$("sparkLine"), rng=$("sparkRange");
-  if(!history.length){pts.setAttribute("points","");rng.textContent="--";return;}
+  var pts=$("sparkLine"), ptsR=$("sparkRaw"), rng=$("sparkRange");
+  if(!history.length){pts.setAttribute("points","");ptsR.setAttribute("points","");rng.textContent="--";return;}
   var min=Infinity,max=-Infinity;
-  for(var i=0;i<history.length;i++){if(history[i]<min)min=history[i];if(history[i]>max)max=history[i];}
-  var span=Math.max(0.2,max-min);
-  var out=[];
+  for(var i=0;i<history.length;i++){
+    if(history[i]<min)min=history[i];
+    if(history[i]>max)max=history[i];
+    if(historyRaw[i]!==undefined){
+      if(historyRaw[i]<min)min=historyRaw[i];
+      if(historyRaw[i]>max)max=historyRaw[i];
+    }
+  }
+  var span=Math.max(0.15,max-min);
+  var out=[], outR=[];
   for(var j=0;j<history.length;j++){
     var x=(history.length===1)?120:(j/(history.length-1))*232+4;
     var y=38-((history[j]-min)/span)*32;
     out.push(x.toFixed(1)+","+y.toFixed(1));
+    if(historyRaw[j]!==undefined){
+      var yr=38-((historyRaw[j]-min)/span)*32;
+      outR.push(x.toFixed(1)+","+yr.toFixed(1));
+    }
   }
   pts.setAttribute("points",out.join(" "));
+  ptsR.setAttribute("points",outR.join(" "));
   rng.textContent="m\u00edn "+min.toFixed(2)+" / m\u00e1x "+max.toFixed(2);
 }
 
@@ -934,7 +1006,7 @@ function render(){
   $("bv14").classList.toggle("on",ver==="v1_4");
   $("c11").classList.toggle("on",ver==="v1_1");
   $("c14").classList.toggle("on",ver==="v1_4");
-  $("uvSub").textContent="calibraci\u00f3n "+(ver==="v1_1"?"V1.1":"V1.4");
+  $("uvSub").textContent="promedio m\u00f3vil \u00b7 "+(ver==="v1_1"?"V1.1":"V1.4");
 
   var stale=commFail||(d&&!d.sensor_ok);
   root.classList.toggle("stale",!!stale);
@@ -951,11 +1023,16 @@ function render(){
 
   if(!d){return;}
 
-  $("uvsRaw").textContent=d.uvs_raw.toLocaleString("es-MX")+(d.uvs_sat?"  SAT!":"");
-  $("alsRaw").textContent=d.als_raw.toLocaleString("es-MX")+(d.als_sat?"  SAT!":"");
+  var mw=d.ma_window||20, mc=d.ma_samples||0;
+  $("maState").textContent="Ventana "+mc+"/"+mw+" muestras (~"+(mc*0.5).toFixed(0)+" s)";
+  var uRawInst=(d.uvs_raw_inst!==undefined)?d.uvs_raw_inst:d.uvs_raw;
+  var aRawInst=(d.als_raw_inst!==undefined)?d.als_raw_inst:d.als_raw;
+  $("uvsRaw").textContent=d.uvs_raw.toLocaleString("es-MX")+" / "+uRawInst.toLocaleString("es-MX")+(d.uvs_sat?" SAT!":"");
+  $("alsRaw").textContent=d.als_raw.toLocaleString("es-MX")+" / "+aRawInst.toLocaleString("es-MX")+(d.als_sat?" SAT!":"");
+  var uInst=d["uvi_"+ver+"_inst"];
+  $("uviInst").textContent=(typeof uInst==="number")?uInst.toFixed(2):"--";
   var ageMs=(typeof d.data_age_ms==="number")?d.data_age_ms:(d.data_age_s*1000);
-  $("sampleAge").textContent=ageMs+" ms";
-  $("esp").textContent="activo "+fmtUp(d.uptime_s)+(d.rssi?" \u00b7 "+d.rssi+" dBm":"");
+  $("esp").textContent=ageMs+" ms \u00b7 "+fmtUp(d.uptime_s)+(d.rssi?" \u00b7 "+d.rssi+" dBm":"");
 
   if(!d.valid){
     $("uv").textContent="--";$("u11").textContent="--";$("u14").textContent="--";
@@ -1017,7 +1094,9 @@ function poll(){
       last=j;lastOkAt=Date.now();commFail=false;
       if(j.valid){
         history.push(j["uvi_"+ver]);
-        if(history.length>40)history.shift();
+        var rawVal=j["uvi_"+ver+"_inst"];
+        historyRaw.push((typeof rawVal==="number")?rawVal:j["uvi_"+ver]);
+        if(history.length>40){history.shift();historyRaw.shift();}
       }
       var dot=$("dot"); dot.classList.add("pulse");
       setTimeout(function(){dot.classList.remove("pulse");},180);
@@ -1083,14 +1162,18 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req) {
   wifi_ap_record_t ap;
   if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
 
-  char buf[512];
+  char buf[640];
   snprintf(buf, sizeof(buf),
-           "{\"uvi_v1_1\":%.2f,\"uvi_v1_4\":%.2f,\"uvs_raw\":%lu,\"uvs_sat\":%s,"
-           "\"lux\":%.1f,\"als_raw\":%lu,\"als_sat\":%s,\"risk_level\":\"%s\","
+           "{\"uvi_v1_1\":%.2f,\"uvi_v1_4\":%.2f,\"uvi_v1_1_inst\":%.2f,\"uvi_v1_4_inst\":%.2f,"
+           "\"uvs_raw\":%lu,\"uvs_raw_inst\":%lu,\"uvs_sat\":%s,"
+           "\"lux\":%.1f,\"als_raw\":%lu,\"als_raw_inst\":%lu,\"als_sat\":%s,\"risk_level\":\"%s\","
+           "\"ma_samples\":%u,\"ma_window\":%u,"
            "\"uptime_s\":%lu,\"valid\":%s,\"sensor_ok\":%s,\"data_age_s\":%lu,\"data_age_ms\":%lu,\"rssi\":%d}",
-           (double)t.uvi11, (double)t.uvi14, (unsigned long)t.uvsRaw, t.uvsSat ? "true" : "false",
-           (double)t.lux, (unsigned long)t.alsRaw, t.alsSat ? "true" : "false",
+           (double)t.uvi11, (double)t.uvi14, (double)t.uvi11Inst, (double)t.uvi14Inst,
+           (unsigned long)t.uvsRaw, (unsigned long)t.uvsRawInst, t.uvsSat ? "true" : "false",
+           (double)t.lux, (unsigned long)t.alsRaw, (unsigned long)t.alsRawInst, t.alsSat ? "true" : "false",
            t.valid ? riskLevel(t.uvi11) : "SIN_DATOS",
+           (unsigned)t.maCount, (unsigned)t.maWindow,
            (unsigned long)(nowMs / 1000UL), t.valid ? "true" : "false",
            t.sensorOk ? "true" : "false", (unsigned long)age, (unsigned long)ageMs, rssi);
 
